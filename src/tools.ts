@@ -13,6 +13,7 @@ const SchedulePromptToolParams = Type.Object({
 			Type.Literal("clear"),
 			Type.Literal("enable"),
 			Type.Literal("disable"),
+			Type.Literal("claim"),
 		],
 		{
 			description: "Action to perform",
@@ -32,7 +33,16 @@ const SchedulePromptToolParams = Type.Object({
 				"Cron expression for recurring tasks. Accepts 5-field (minute hour dom month dow) or 6-field (sec minute hour dom month dow).",
 		}),
 	),
-	id: Type.Optional(Type.String({ description: "Task id for delete action" })),
+	id: Type.Optional(Type.String({ description: "Task id for delete/enable/disable/claim actions" })),
+	all: Type.Optional(
+		Type.Boolean({
+			description:
+				"claim/clear: apply to every task in this directory that is not owned by the current session. Without it, clear only touches this session's tasks.",
+		}),
+	),
+	from: Type.Optional(
+		Type.String({ description: "claim with all=true: only claim tasks owned by this originating session id" }),
+	),
 });
 
 type SchedulePromptToolParamsType = Static<typeof SchedulePromptToolParams>;
@@ -42,13 +52,14 @@ export function registerTools(pi: ExtensionAPI, runtime: SchedulerRuntime) {
 		name: "schedule_prompt",
 		label: "Schedule Prompt",
 		description:
-			"Create/list/enable/disable/delete scheduled prompts. Use this when the user asks for reminders or recurring checks. add requires prompt; once tasks require duration; recurring supports interval (duration) or cron expression (cron).",
+			"Create/list/enable/disable/delete/claim scheduled prompts. Tasks are stored per working directory and work across sessions; claim reassigns a task to the current session. add requires prompt; once tasks require duration; recurring supports interval (duration) or cron expression.",
 		promptSnippet:
-			"Create/list/enable/disable/delete scheduled prompts. Supports recurring intervals/cron and one-time reminders (session-scoped).",
+			"Create/list/enable/disable/delete/claim scheduled prompts. Tasks are shared per working directory across sessions; use claim to take over a task owned by another session.",
 		promptGuidelines: [
 			"Use this tool when user asks to remind/check back later.",
 			"For recurring tasks use kind='recurring' with duration like 5m or 2h, or provide cron.",
 			"For one-time reminders use kind='once' with duration like 30m or 1h.",
+			"If a task is listed as owned by another session and the user wants it here, call action='claim' with its id (or all=true).",
 		],
 		parameters: SchedulePromptToolParams,
 		execute: async (
@@ -69,13 +80,18 @@ export function registerTools(pi: ExtensionAPI, runtime: SchedulerRuntime) {
 					const state = task.enabled ? "on" : "off";
 					const status = task.lastStatus ?? "pending";
 					const last = task.lastRunAt ? runtime.formatRelativeTime(task.lastRunAt) : "never";
-					return `${task.id}\t${state}\t${task.kind}\t${schedule}\t${runtime.formatRelativeTime(task.nextRunAt)}\t${task.runCount}\t${last}\t${status}\t${task.prompt}`;
+					const owner = task.ownerSessionId
+						? task.ownerSessionId === runtime.sessionId
+							? "self"
+							: task.ownerSessionId.slice(0, 8)
+						: "unowned";
+					return `${task.id}\t${state}\t${owner}\t${task.kind}\t${schedule}\t${runtime.formatRelativeTime(task.nextRunAt)}\t${task.runCount}\t${last}\t${status}\t${task.prompt}`;
 				});
 				return {
 					content: [
 						{
 							type: "text",
-							text: `Scheduled tasks (id\tstate\tkind\tschedule\tnext\truns\tlast\tstatus\tprompt):\n${lines.join("\n")}`,
+							text: `Scheduled tasks (id\tstate\towner\tkind\tschedule\tnext\truns\tlast\tstatus\tprompt):\n${lines.join("\n")}`,
 						},
 					],
 					details: { action, tasks: list },
@@ -83,10 +99,82 @@ export function registerTools(pi: ExtensionAPI, runtime: SchedulerRuntime) {
 			}
 
 			if (action === "clear") {
-				const count = runtime.clearTasks();
+				const sessionId = runtime.sessionId;
+				if (!params.all && !sessionId) {
+					return {
+						content: [{ type: "text", text: "Error: cannot determine current session id. Pass all=true to clear everything." }],
+						details: { action, error: "missing_session" },
+					};
+				}
+				const count = params.all ? runtime.clearTasks() : runtime.clearTasks(sessionId);
 				return {
-					content: [{ type: "text", text: `Cleared ${count} scheduled task${count === 1 ? "" : "s"}.` }],
-					details: { action, cleared: count },
+					content: [
+						{
+							type: "text",
+							text: `Cleared ${count} scheduled task${count === 1 ? "" : "s"}${params.all ? "" : " (tasks owned by other sessions were kept)"}.`,
+						},
+					],
+					details: { action, cleared: count, all: Boolean(params.all) },
+				};
+			}
+
+			if (action === "claim") {
+				const sessionId = runtime.sessionId;
+				if (!sessionId) {
+					return {
+						content: [{ type: "text", text: "Error: cannot determine current session id." }],
+						details: { action, error: "missing_session" },
+					};
+				}
+
+				if (params.all) {
+					const result = runtime.claimAll(sessionId, runtime.sessionName, params.from?.trim() || undefined);
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									result.claimed === 0
+										? "No tasks to claim."
+										: `Claimed ${result.claimed} task(s) to this session: ${result.ids.join(", ")}`,
+							},
+						],
+						details: { action, ...result },
+					};
+				}
+
+				const id = params.id?.trim();
+				if (!id) {
+					return {
+						content: [{ type: "text", text: "Error: id is required for claim action (or pass all=true)." }],
+						details: { action, error: "missing_id" },
+					};
+				}
+
+				const result = runtime.claimTask(id, sessionId, runtime.sessionName);
+				if (!result.ok) {
+					return {
+						content: [
+							{
+								type: "text",
+								text:
+									result.reason === "already_owned"
+										? `Task ${id} already belongs to this session.`
+										: `Task not found: ${id}`,
+							},
+						],
+						details: { action, id, claimed: false, reason: result.reason },
+					};
+				}
+
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Claimed ${id} to this session${result.from ? ` (was owned by ${result.from.slice(0, 8)})` : " (previously unowned)"}.`,
+						},
+					],
+					details: { action, id, claimed: true, from: result.from },
 				};
 			}
 

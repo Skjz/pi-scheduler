@@ -60,7 +60,8 @@ export function registerCommands(pi: ExtensionAPI, runtime: SchedulerRuntime) {
 	});
 
 	pi.registerCommand("schedule", {
-		description: "Manage schedules. No args opens TUI manager. Also: list | enable <id> | disable <id> | delete <id> | clear",
+		description:
+			"Manage schedules. No args opens TUI manager. Also: list | enable <id> | disable <id> | delete <id> | claim <id> | claim --all [--from <id>] | clear [--all]",
 		handler: async (args, ctx) => {
 			const trimmed = args.trim();
 			if (!trimmed || trimmed === "tui") {
@@ -109,13 +110,70 @@ export function registerCommands(pi: ExtensionAPI, runtime: SchedulerRuntime) {
 				return;
 			}
 
-			if (action === "clear") {
-				const count = runtime.clearTasks();
-				ctx.ui.notify(`Cleared ${count} task${count === 1 ? "" : "s"}.`, "info");
+			if (action === "claim") {
+				const sessionId = runtime.sessionId;
+				if (!sessionId) {
+					ctx.ui.notify("Cannot determine current session id.", "warning");
+					return;
+				}
+
+				if (rawArg === "--all") {
+					const rest = trimmed.split(/\s+/).slice(2);
+					const fromIndex = rest.indexOf("--from");
+					const fromSessionId = fromIndex >= 0 ? rest[fromIndex + 1] : undefined;
+					const result = runtime.claimAll(sessionId, runtime.sessionName, fromSessionId);
+					if (result.claimed === 0) {
+						ctx.ui.notify("No tasks to claim.", "info");
+						return;
+					}
+					ctx.ui.notify(`Claimed ${result.claimed} task(s) to this session: ${result.ids.join(", ")}`, "info");
+					return;
+				}
+
+				if (!rawArg) {
+					ctx.ui.notify("Usage: /schedule claim <id> | /schedule claim --all [--from <sessionId>]", "warning");
+					return;
+				}
+
+				const result = runtime.claimTask(rawArg, sessionId, runtime.sessionName);
+				if (!result.ok) {
+					ctx.ui.notify(
+						result.reason === "already_owned"
+							? `Task ${rawArg} already belongs to this session.`
+							: `Task not found: ${rawArg}`,
+						"warning",
+					);
+					return;
+				}
+				const from = result.from ? ` (from ${result.from.slice(0, 8)})` : " (previously unowned)";
+				ctx.ui.notify(`Claimed ${rawArg} to this session${from}.`, "info");
 				return;
 			}
 
-			ctx.ui.notify("Usage: /schedule [tui|list|enable <id>|disable <id>|delete <id>|clear]", "warning");
+			if (action === "clear") {
+				if (rawArg === "--all") {
+					const count = runtime.clearTasks();
+					ctx.ui.notify(`Cleared ${count} task${count === 1 ? "" : "s"}.`, "info");
+					return;
+				}
+
+				const sessionId = runtime.sessionId;
+				if (!sessionId) {
+					ctx.ui.notify("Cannot determine current session id. Use /schedule clear --all to clear everything.", "warning");
+					return;
+				}
+				const count = runtime.clearTasks(sessionId);
+				ctx.ui.notify(
+					`Cleared ${count} task${count === 1 ? "" : "s"}. Tasks owned by other sessions were kept (use /schedule clear --all to remove them).`,
+					"info",
+				);
+				return;
+			}
+
+			ctx.ui.notify(
+				"Usage: /schedule [tui|list|enable <id>|disable <id>|delete <id>|claim <id>|claim --all [--from <id>]|clear [--all]]",
+				"warning",
+			);
 		},
 	});
 
