@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerCommands } from "./commands";
 import { registerEvents } from "./events";
 import { SchedulerRuntime } from "./runtime";
