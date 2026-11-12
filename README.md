@@ -23,11 +23,12 @@ Then restart pi or run:
 The agent can call this tool with actions:
 
 - `add` (supports `kind: recurring|once`, `prompt`, and either `duration` or `cron` for recurring)
-- `list` (includes state/run stats)
+- `list` (includes owner, state and run stats)
 - `enable` (`id`)
 - `disable` (`id`)
 - `delete` (`id`)
-- `clear`
+- `claim` (`id`, or `all: true` with optional `from`)
+- `clear` (current session's tasks; pass `all: true` to wipe the directory)
 
 Recurring schedules can be interval-based (`duration`, e.g. `5m`) or cron-based (`cron`, e.g. `*/5 * * * *`).
 
@@ -68,6 +69,7 @@ With no args, this opens an interactive TUI manager where you can:
 - select a task
 - change schedule/delay (interval or cron for recurring tasks)
 - run it now
+- claim it to the current session
 - delete it
 
 CLI subcommands also work:
@@ -77,7 +79,9 @@ CLI subcommands also work:
 /schedule enable <id>
 /schedule disable <id>
 /schedule delete <id>
-/schedule clear
+/schedule claim <id>
+/schedule claim --all [--from <sessionId>]
+/schedule clear [--all]
 ```
 
 ### `/unschedule`
@@ -113,10 +117,15 @@ Examples:
 ## Behavior
 
 - Tasks are checked every second.
-- Tasks are persisted to `.pi/scheduler.json` and reloaded on next session start.
+- Tasks are persisted to `.pi/scheduler.json`, scoped to the **working directory** rather than to a single session. Opening another pi window in the same directory sees the same task list.
+- Only one process per directory actually runs tasks. A lease file at `.pi/scheduler.lock` (pid + instance id + heartbeat) elects a leader; every other window is a read-only observer. Closing the leader hands the lease over within a few seconds.
+- The status bar counts only the current session's tasks. Tasks owned by another session show up as `(+N other sessions)` rather than silently appearing as yours, and tasks written before ownership was tracked show up as `to claim`.
+- If a task's owning session is gone, whichever window holds the lease runs it and prefixes the message with `⏰ [taken over] …` so you can tell where it came from.
+- `claim` reassigns a task to the current session and takes over the lease, so the original window stops running it.
+- Writes are merged, not overwritten: each task carries an `updatedAt`, and deletions leave a tombstone. Two windows editing tasks at the same time no longer erase each other's work.
 - Tasks run only when pi is idle (between turns).
 - If a task becomes due while busy, it runs once when pi is idle.
-- One-time tasks remove themselves after running.
+- One-time tasks are removed after running.
 - Recurring tasks auto-expire after 3 days.
 - Tasks can be enabled/disabled without deleting.
 - List views include run stats (`runCount`, last run, last status).
@@ -124,7 +133,8 @@ Examples:
 
 ## Limitations
 
-- Session-scoped execution only (tasks fire while pi is running).
+- Tasks fire only while pi is running — there is no background daemon.
+- Coordination between windows happens through the filesystem, so state converges within about a second rather than instantly.
 - No wall-clock parsing (`at 3pm`) yet.
 
 ## Troubleshooting
@@ -139,6 +149,10 @@ Examples:
 - Tasks only fire when pi is idle
 - Check pending tasks with `/schedule list`
 - Ensure task is enabled (`/schedule enable <id>`)
+- If the task belongs to another window, either keep that window open or run `/schedule claim <id>` here to take it over
+
+### A task keeps appearing in a window that did not create it
+- Tasks are shared per working directory, not per session. Run `/schedule list` to see the `other session` marker, then `/schedule claim <id>` to move it here, or `/schedule delete <id>` to drop it.
 
 ## Development
 
@@ -153,6 +167,8 @@ npm run check
 - `index.ts` — thin package entrypoint
 - `src/index.ts` — extension wiring
 - `src/runtime.ts` — scheduler state/runtime + task manager UI flow
+- `src/lease.ts` — cross-process leader lease (`.pi/scheduler.lock`)
+- `src/store.ts` — persistence, task merge and tombstones
 - `src/commands.ts` — slash commands (`/loop`, `/remind`, `/schedule`, `/unschedule`)
 - `src/tools.ts` — `schedule_prompt` tool
 - `src/events.ts` — session lifecycle event handlers
